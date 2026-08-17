@@ -75,7 +75,7 @@ $LogDir = Join-Path $Root "logs"
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
 foreach ($required in @($ServerExe, $MainModel)) {
-    if (-not (Test-Path -LiteralPath $required)) { throw "Required file not found: $required (run Install-LlamaCuda.ps1 / Download-Model.ps1 first)" }
+    if (-not (Test-Path -LiteralPath $required)) { throw "Required file not found: $required" }
 }
 if ($UseMtp -and -not (Test-Path -LiteralPath $DraftModel)) {
     throw "MTP draft model not found: $DraftModel"
@@ -96,6 +96,19 @@ if ($UseMtp -and $CtxSize -gt 65536) {
     Write-Warning "MTP measured 17x SLOWER than no-MTP at 32768 depth on generic content (rejected drafts get more expensive as context grows). Worth it mainly for short/code-heavy sessions -- see script header. Drop -EnableMtp for long-context use."
 }
 Write-Host "Cache type: $CacheType | context: $CtxSize | MTP: $(if ($UseMtp) { 'on' } else { 'off' })"
+
+# ---- clear out any stale server from a previous run ----
+# Start-Process launches llama-server.exe as an independent process, not a true child
+# of this console. Closing the console window (the [X] button) sends CTRL_CLOSE_EVENT,
+# which Windows can force-tear-down the console session for *before* this script's
+# `finally` block gets a chance to run -- so the old server survives, still holding the
+# log files open (hence the Set-Content lock error) and the port bound.
+$stale = Get-Process llama-server -ErrorAction SilentlyContinue
+if ($stale) {
+    Write-Warning "Found $($stale.Count) leftover llama-server process(es) from a previous run (likely the console window was closed instead of Ctrl+C). Stopping them."
+    $stale | Stop-Process -Force -ErrorAction SilentlyContinue
+    Start-Sleep -Seconds 1
+}
 
 $args = @(
     "--model", $MainModel,
@@ -148,7 +161,62 @@ Write-Host "  Context:     $CtxSize ($CacheType KV cache)$(if ($NoKvOffload) { '
 Write-Host "  Reasoning effort: $ReasoningEffort"
 Write-Host ""
 
+# ---- console control handler: reliably kills llama-server if this window is closed ----
+# A `finally` block only runs on a normal exit or Ctrl+C (which raises a real .NET
+# exception PowerShell can catch). Clicking the console window's [X] sends
+# CTRL_CLOSE_EVENT, which Windows can act on before `finally` gets scheduled. This
+# handler is a native callback the OS invokes directly, so it fires reliably even then.
+if (-not ("QwenServerCleanup" -as [type])) {
+    Add-Type -TypeDefinition @"
+using System;
+using System.Diagnostics;
+using System.Runtime.InteropServices;
+
+public static class QwenServerCleanup
+{
+    private delegate bool HandlerRoutine(uint ctrlType);
+    private static readonly HandlerRoutine Handler = new HandlerRoutine(Handle);
+    private static int TargetPid = -1;
+
+    [DllImport("kernel32.dll")]
+    private static extern bool SetConsoleCtrlHandler(HandlerRoutine handler, bool add);
+
+    public static void Install()
+    {
+        SetConsoleCtrlHandler(Handler, true);
+    }
+
+    public static void SetTarget(int pid)
+    {
+        TargetPid = pid;
+    }
+
+    private static bool Handle(uint ctrlType)
+    {
+        // 0=CTRL_C, 1=CTRL_BREAK, 2=CTRL_CLOSE, 5=CTRL_LOGOFF, 6=CTRL_SHUTDOWN
+        if (ctrlType == 0 || ctrlType == 1 || ctrlType == 2 || ctrlType == 5 || ctrlType == 6)
+        {
+            if (TargetPid > 0)
+            {
+                try
+                {
+                    using (Process p = Process.GetProcessById(TargetPid))
+                    {
+                        if (!p.HasExited) { p.Kill(); }
+                    }
+                }
+                catch { }
+            }
+        }
+        return false;
+    }
+}
+"@
+}
+[QwenServerCleanup]::Install()
+
 $proc = Start-Process -FilePath $ServerExe -ArgumentList $args -WorkingDirectory $Root -RedirectStandardOutput $Out -RedirectStandardError $Err -WindowStyle Hidden -PassThru
+[QwenServerCleanup]::SetTarget($proc.Id)
 
 $tailJob = Start-Job -ScriptBlock {
     param($ErrPath)
@@ -181,6 +249,15 @@ try {
 
     Write-Host ""
     Write-Host "Ready: http://${BindHost}:${Port}/v1  (PID $($proc.Id))"
+    $lanIps = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+        Where-Object { $_.IPAddress -notlike "127.*" -and $_.IPAddress -notlike "169.254.*" -and $_.AddressState -eq "Preferred" } |
+        Select-Object -ExpandProperty IPAddress -Unique
+    if ($BindHost -eq "0.0.0.0") {
+        foreach ($ip in $lanIps) { Write-Host "LAN:   http://${ip}:${Port}/v1  (reachable from other devices on this network)" }
+    } else {
+        foreach ($ip in $lanIps) { Write-Host "LAN IP: $ip  (server is bound to $BindHost, NOT reachable from other devices -- pass -BindHost 0.0.0.0 to open it up)" }
+    }
+    if (-not $lanIps) { Write-Host "LAN:   no private IPv4 address found" }
     Write-Host "Logs: $Out / $Err"
     Write-Host "Close this window or Ctrl+C to stop the server."
     Write-Host ""

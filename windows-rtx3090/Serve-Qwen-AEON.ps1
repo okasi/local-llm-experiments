@@ -262,16 +262,24 @@ $tailJob = Start-Job -ScriptBlock {
     Get-Content -LiteralPath $ErrPath -Wait
 } -ArgumentList $Err
 
-if ($Tls) {
-    # self-signed cert we generated ourselves, for our own health checks against our own
-    # server -- not validating a third party, so bypassing the trust chain here is fine
-    [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
-}
-$healthHeaders = @{}
-if ($ApiKey) { $healthHeaders["Authorization"] = "Bearer $ApiKey" }
 # 0.0.0.0 means "listen on every interface" -- it's not itself a connectable address,
 # so our own health probe always targets loopback regardless of what the server binds to.
 $HealthCheckHost = if ($BindHost -eq "0.0.0.0") { "127.0.0.1" } else { $BindHost }
+
+# Health checks shell out to curl.exe rather than Invoke-RestMethod: Windows PowerShell
+# 5.1's .NET Framework TLS stack fails the handshake against llama-server's OpenSSL 3.x
+# listener (tried forcing TLS 1.2 explicitly -- still failed, looks like a cipher-suite
+# mismatch, not just a protocol-version one), while curl.exe's independent TLS stack
+# connects fine. Without this, every health check silently throws and gets swallowed by
+# the retry loop, burning the full timeout against a server that's actually healthy.
+function Test-ServerHealthy {
+    param([string]$Url, [string]$ApiKey, [bool]$Insecure)
+    $curlArgs = @("-s", "-m", "2", "-o", "NUL", "-w", "%{http_code}", $Url)
+    if ($Insecure) { $curlArgs = @("-k") + $curlArgs }
+    if ($ApiKey) { $curlArgs = @("-H", "Authorization: Bearer $ApiKey") + $curlArgs }
+    $code = & curl.exe @curlArgs 2>$null
+    return $code -eq "200"
+}
 
 try {
     $healthy = $false
@@ -283,10 +291,9 @@ try {
             Get-Content -LiteralPath $Err -Tail 80
             throw "llama-server failed to start"
         }
-        try {
-            $resp = Invoke-RestMethod -Uri "${Scheme}://${HealthCheckHost}:${Port}/health" -Headers $healthHeaders -TimeoutSec 2
-            if ($resp.status -eq "ok") { $healthy = $true; break }
-        } catch { }
+        if (Test-ServerHealthy -Url "${Scheme}://${HealthCheckHost}:${Port}/health" -ApiKey $ApiKey -Insecure $Tls) {
+            $healthy = $true; break
+        }
         if ($i % 10 -eq 0) { Write-Host "Still loading model... ($($i*2)s)" }
     }
 

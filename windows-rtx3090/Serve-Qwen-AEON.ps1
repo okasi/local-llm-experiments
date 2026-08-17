@@ -269,6 +269,9 @@ if ($Tls) {
 }
 $healthHeaders = @{}
 if ($ApiKey) { $healthHeaders["Authorization"] = "Bearer $ApiKey" }
+# 0.0.0.0 means "listen on every interface" -- it's not itself a connectable address,
+# so our own health probe always targets loopback regardless of what the server binds to.
+$HealthCheckHost = if ($BindHost -eq "0.0.0.0") { "127.0.0.1" } else { $BindHost }
 
 try {
     $healthy = $false
@@ -281,7 +284,7 @@ try {
             throw "llama-server failed to start"
         }
         try {
-            $resp = Invoke-RestMethod -Uri "${Scheme}://${BindHost}:${Port}/health" -Headers $healthHeaders -TimeoutSec 2
+            $resp = Invoke-RestMethod -Uri "${Scheme}://${HealthCheckHost}:${Port}/health" -Headers $healthHeaders -TimeoutSec 2
             if ($resp.status -eq "ok") { $healthy = $true; break }
         } catch { }
         if ($i % 10 -eq 0) { Write-Host "Still loading model... ($($i*2)s)" }
@@ -294,10 +297,10 @@ try {
     }
 
     Write-Host ""
-    Write-Host "Ready: ${Scheme}://${BindHost}:${Port}/v1  (PID $($proc.Id))"
+    Write-Host "Ready: ${Scheme}://${HealthCheckHost}:${Port}/v1  (PID $($proc.Id))"
     if ($ApiKey) {
         Write-Host "API key required. Example:"
-        Write-Host "  curl $(if ($Tls) { '-k ' })${Scheme}://${BindHost}:${Port}/v1/models -H `"Authorization: Bearer $ApiKey`""
+        Write-Host "  curl $(if ($Tls) { '-k ' })${Scheme}://${HealthCheckHost}:${Port}/v1/models -H `"Authorization: Bearer $ApiKey`""
     } else {
         Write-Warning "No API key set -- anyone who can reach this port can use the server. Add -RequireApiKey."
     }

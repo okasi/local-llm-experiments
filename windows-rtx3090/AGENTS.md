@@ -37,19 +37,23 @@ Run PowerShell commands from `windows-rtx3090/`.
 - sampler: `1.0 / 0.95 / 30 / min_p 0.0 / presence_penalty 0.0`
 - reasoning effort: `medium` (this model defaults to `xhigh` via its chat template,
   which burns tokens badly overthinking simple prompts -- always pin it explicitly)
-- auth/TLS: both **off** by default (matches upstream llama-server). No CORS
-  credentials regardless (`--no-cors-credentials` always set; harmless since auth
-  is a bearer header, not a cookie). Turn `-RequireApiKey` and `-Tls` on before
-  this server is reachable from anywhere you don't already trust -- see Security.
+- bind host: **`0.0.0.0`** -- reachable from other devices on the LAN out of the
+  box, no flag needed. Auth/TLS are the opposite: both **off** by default (matches
+  upstream llama-server), so a stock run is reachable *and unauthenticated* on the
+  LAN -- the startup banner prints a loud warning every time `-RequireApiKey`
+  isn't set, on purpose. Pass `-BindHost 127.0.0.1` to go back to localhost-only.
+- No CORS credentials regardless (`--no-cors-credentials` always set; harmless
+  since auth is a bearer header, not a cookie).
 
 ## Commands
 
 ```powershell
 .\Install-LlamaCuda.ps1
 .\Download-Model.ps1
-.\Serve-Qwen-AEON.ps1                          # 262144, q4_0, no MTP
+.\Serve-Qwen-AEON.ps1                          # 262144, q4_0, no MTP, LAN-reachable, no auth
 .\Serve-Qwen-AEON.ps1 -EnableMtp -CtxSize 32768  # short/code-heavy session
-.\Serve-Qwen-AEON.ps1 -RequireApiKey -Tls -BindHost 0.0.0.0  # reachable + auth'd + encrypted
+.\Serve-Qwen-AEON.ps1 -RequireApiKey -Tls        # LAN-reachable + auth'd + encrypted
+.\Serve-Qwen-AEON.ps1 -BindHost 127.0.0.1        # localhost-only, no LAN exposure at all
 .\bench\Sample-Vram.ps1 -DurationSeconds 120
 ```
 
@@ -64,11 +68,15 @@ equivalent since nothing signed it but itself, but the connection is still
 encrypted, which matters once the key is travelling over the open internet
 instead of localhost/LAN.
 
-Neither flag does anything about the server being reachable in the first place --
-that's `-BindHost 0.0.0.0` plus whatever you do at the router/firewall level
-(port forward, tunnel, etc.), which is out of scope for this script on purpose.
-`-np 1` means the server is inherently single-request: opening it up, even with
-auth, means anyone with the key can fully occupy it with one request.
+The bind host defaulting to `0.0.0.0` only gets you LAN reachability -- WAN
+exposure (port forward, tunnel, etc.) is a separate, deliberate step at the
+router/firewall level, out of scope for this script on purpose. `-np 1` means
+the server is inherently single-request: opening it up, even with auth, means
+anyone with the key (or anyone at all, without one) can fully occupy it with a
+single request. On a residential ISP, don't assume a port-forward rule alone
+makes this WAN-reachable -- many ISPs block unsolicited inbound connections at
+their edge regardless of router configuration; verify from an actual external
+network before relying on it.
 
 ## Gotchas
 

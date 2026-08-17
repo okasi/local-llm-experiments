@@ -42,7 +42,7 @@ Model facts (read directly from the GGUF header):
 #>
 param(
     [int]$Port = 8085,
-    [string]$BindHost = "127.0.0.1",
+    [string]$BindHost = "0.0.0.0",
     [int]$CtxSize = 262144,
     [int]$Threads = 12,
     [int]$NGL = 999,

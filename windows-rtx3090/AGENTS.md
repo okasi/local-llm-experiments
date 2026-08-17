@@ -11,7 +11,10 @@ Run PowerShell commands from `windows-rtx3090/`.
 - `Download-Model.ps1`: downloads the Qwen3.8-27B AEON Q4_K_M weights and MTP draft
   head into `models/`.
 - `Serve-Qwen-AEON.ps1`: llama-server lifecycle -- start, wait for `/health`, stream
-  logs, clean shutdown on Ctrl+C.
+  logs, clean shutdown on Ctrl+C (and on the console window being closed, see
+  Gotchas). `-RequireApiKey` / `-Tls` add auth and encryption; both off by default.
+- `New-SelfSignedCert.ps1`: generates the self-signed TLS cert/key pair `-Tls` uses,
+  covering `localhost` plus every private IPv4 currently on the machine.
 - `Fix-TDR-Timeout.ps1`: one-time admin-only fix for a Windows GPU driver timeout
   that can kill the CUDA context under sustained load (see Gotchas below).
 - `bench/Sample-Vram.ps1`: polls `nvidia-smi` on an interval, reports peak/avg VRAM.
@@ -34,6 +37,10 @@ Run PowerShell commands from `windows-rtx3090/`.
 - sampler: `1.0 / 0.95 / 30 / min_p 0.0 / presence_penalty 0.0`
 - reasoning effort: `medium` (this model defaults to `xhigh` via its chat template,
   which burns tokens badly overthinking simple prompts -- always pin it explicitly)
+- auth/TLS: both **off** by default (matches upstream llama-server). No CORS
+  credentials regardless (`--no-cors-credentials` always set; harmless since auth
+  is a bearer header, not a cookie). Turn `-RequireApiKey` and `-Tls` on before
+  this server is reachable from anywhere you don't already trust -- see Security.
 
 ## Commands
 
@@ -42,8 +49,26 @@ Run PowerShell commands from `windows-rtx3090/`.
 .\Download-Model.ps1
 .\Serve-Qwen-AEON.ps1                          # 262144, q4_0, no MTP
 .\Serve-Qwen-AEON.ps1 -EnableMtp -CtxSize 32768  # short/code-heavy session
+.\Serve-Qwen-AEON.ps1 -RequireApiKey -Tls -BindHost 0.0.0.0  # reachable + auth'd + encrypted
 .\bench\Sample-Vram.ps1 -DurationSeconds 120
 ```
+
+## Security
+
+`-RequireApiKey` generates and persists a random key to `secrets/api-key.txt` on
+first use (gitignored, never commit it) and requires it as `Authorization: Bearer
+<key>` on inference endpoints -- `/v1/models` stays open by upstream design (no
+user data in it). `-Tls` serves HTTPS via a self-signed cert from `New-
+SelfSignedCert.ps1` (also gitignored); clients need `-k`/`--insecure` or
+equivalent since nothing signed it but itself, but the connection is still
+encrypted, which matters once the key is travelling over the open internet
+instead of localhost/LAN.
+
+Neither flag does anything about the server being reachable in the first place --
+that's `-BindHost 0.0.0.0` plus whatever you do at the router/firewall level
+(port forward, tunnel, etc.), which is out of scope for this script on purpose.
+`-np 1` means the server is inherently single-request: opening it up, even with
+auth, means anyone with the key can fully occupy it with one request.
 
 ## Gotchas
 

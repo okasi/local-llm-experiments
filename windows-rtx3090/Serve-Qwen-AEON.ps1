@@ -1,10 +1,10 @@
 <#
 Launches llama-server for Qwen3.8-27B-AEON-ULTIMATE-UNCENSORED (Q4_K_M), tuned for a
 single RTX 3090 (24GB VRAM). Default profile is the full native 262144-token context
-with q4_0 KV cache and no MTP draft model -- head-to-head benchmarking (see the root
-README) found this 4.7x faster than 163840/q8_0/MTP once real long context is in
+with q4_0 KV cache and no MTP draft model -- head-to-head benchmarking (see bench\report
+in this repo) found this 4.7x faster than 163840/q8_0/MTP once real long context is in
 play, for statistically identical quality. Pass -EnableMtp for the short-context,
-code-heavy case where MTP is still a genuine ~1.7x win.
+code-heavy case where MTP is still a genuine ~1.7x win (see report SS4).
 
 Model facts (read directly from the GGUF header):
   architecture=qwen35  layers=65  embd=5120  kv_heads=4  head_dim=256  native_ctx=262144
@@ -56,6 +56,9 @@ param(
     [switch]$NoKvOffload,      # keep KV cache in system RAM instead of VRAM (last resort; see notes above -- compute buffers still need GPU headroom even with this on)
     [switch]$EnableMtp,        # turn MTP back on -- worth it for short/code-heavy sessions, a net loss for long generic-content ones (see header)
     [switch]$DisableMtp,       # deprecated alias, MTP is now off by default -- kept so old invocations still work
+
+    [switch]$RequireApiKey,    # require --Authorization: Bearer <key>; auto-generates and persists a key to secrets\api-key.txt on first use
+    [switch]$Tls,              # serve HTTPS using the self-signed cert in tls\ (run New-SelfSignedCert.ps1 first if it's missing)
     [string[]]$ExtraServerArgs = @()
 )
 
@@ -79,6 +82,37 @@ foreach ($required in @($ServerExe, $MainModel)) {
 }
 if ($UseMtp -and -not (Test-Path -LiteralPath $DraftModel)) {
     throw "MTP draft model not found: $DraftModel"
+}
+
+# ---- API key (opt-in) -- auto-generates and persists to secrets\api-key.txt on first use.
+# That file is deliberately outside anything meant to be committed to git.
+$ApiKey = $null
+if ($RequireApiKey) {
+    $SecretsDir = Join-Path $Root "secrets"
+    $ApiKeyFile = Join-Path $SecretsDir "api-key.txt"
+    New-Item -ItemType Directory -Force -Path $SecretsDir | Out-Null
+    if (-not (Test-Path -LiteralPath $ApiKeyFile)) {
+        $ApiKey = -join ((1..32) | ForEach-Object { "{0:x2}" -f (Get-Random -Maximum 256) })
+        Set-Content -LiteralPath $ApiKeyFile -Value $ApiKey -NoNewline -Encoding ascii
+        Write-Host "Generated new API key, saved to $ApiKeyFile"
+    } else {
+        $ApiKey = (Get-Content -LiteralPath $ApiKeyFile -Raw).Trim()
+    }
+}
+
+# ---- TLS (opt-in) -- self-signed cert in tls\, generated once via New-SelfSignedCert.ps1.
+# A self-signed cert means clients see a trust warning (or need -k/--insecure with curl) --
+# that's expected. It still encrypts the connection, which matters once the API key is
+# travelling over the open internet instead of localhost/LAN.
+$Scheme = "http"
+if ($Tls) {
+    $TlsDir = Join-Path $Root "tls"
+    $TlsKey = Join-Path $TlsDir "server.key"
+    $TlsCert = Join-Path $TlsDir "server.crt"
+    if (-not (Test-Path -LiteralPath $TlsKey) -or -not (Test-Path -LiteralPath $TlsCert)) {
+        throw "TLS cert/key not found in $TlsDir. Run New-SelfSignedCert.ps1 first."
+    }
+    $Scheme = "https"
 }
 
 # ---- sanity check against measured behavior (see header notes; this model's KV cache
@@ -129,8 +163,12 @@ $args = @(
     "--top-p", "0.95",
     "--top-k", "30",
     "--min-p", "0.0",
-    "--presence-penalty", "0.0"
+    "--presence-penalty", "0.0",
+    "--no-cors-credentials"    # harmless tightening: we auth via a bearer header, not cookies, so no reason to allow credentialed cross-origin requests
 )
+
+if ($ApiKey) { $args += @("--api-key", $ApiKey) }
+if ($Tls) { $args += @("--ssl-key-file", $TlsKey, "--ssl-cert-file", $TlsCert) }
 
 if ($UseMtp) {
     # draft cache type must match main cache type at large contexts -- a q8_0 draft
@@ -224,6 +262,14 @@ $tailJob = Start-Job -ScriptBlock {
     Get-Content -LiteralPath $ErrPath -Wait
 } -ArgumentList $Err
 
+if ($Tls) {
+    # self-signed cert we generated ourselves, for our own health checks against our own
+    # server -- not validating a third party, so bypassing the trust chain here is fine
+    [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+}
+$healthHeaders = @{}
+if ($ApiKey) { $healthHeaders["Authorization"] = "Bearer $ApiKey" }
+
 try {
     $healthy = $false
     for ($i = 0; $i -lt 300; $i++) {
@@ -235,7 +281,7 @@ try {
             throw "llama-server failed to start"
         }
         try {
-            $resp = Invoke-RestMethod -Uri "http://${BindHost}:${Port}/health" -TimeoutSec 2
+            $resp = Invoke-RestMethod -Uri "${Scheme}://${BindHost}:${Port}/health" -Headers $healthHeaders -TimeoutSec 2
             if ($resp.status -eq "ok") { $healthy = $true; break }
         } catch { }
         if ($i % 10 -eq 0) { Write-Host "Still loading model... ($($i*2)s)" }
@@ -248,12 +294,18 @@ try {
     }
 
     Write-Host ""
-    Write-Host "Ready: http://${BindHost}:${Port}/v1  (PID $($proc.Id))"
+    Write-Host "Ready: ${Scheme}://${BindHost}:${Port}/v1  (PID $($proc.Id))"
+    if ($ApiKey) {
+        Write-Host "API key required. Example:"
+        Write-Host "  curl $(if ($Tls) { '-k ' })${Scheme}://${BindHost}:${Port}/v1/models -H `"Authorization: Bearer $ApiKey`""
+    } else {
+        Write-Warning "No API key set -- anyone who can reach this port can use the server. Add -RequireApiKey."
+    }
     $lanIps = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
         Where-Object { $_.IPAddress -notlike "127.*" -and $_.IPAddress -notlike "169.254.*" -and $_.AddressState -eq "Preferred" } |
         Select-Object -ExpandProperty IPAddress -Unique
     if ($BindHost -eq "0.0.0.0") {
-        foreach ($ip in $lanIps) { Write-Host "LAN:   http://${ip}:${Port}/v1  (reachable from other devices on this network)" }
+        foreach ($ip in $lanIps) { Write-Host "LAN:   ${Scheme}://${ip}:${Port}/v1  (reachable from other devices on this network)" }
     } else {
         foreach ($ip in $lanIps) { Write-Host "LAN IP: $ip  (server is bound to $BindHost, NOT reachable from other devices -- pass -BindHost 0.0.0.0 to open it up)" }
     }

@@ -61,3 +61,7 @@ windows-rtx3090/bench/*.json
 windows-rtx3090/bench/*.csv
 windows-rtx3090/bench/report.html
 windows-rtx3090/runs/
+
+# Secrets and generated TLS material -- never commit these
+windows-rtx3090/secrets/
+windows-rtx3090/tls/

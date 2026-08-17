@@ -2,6 +2,7 @@
 logs/
 windows-strix-halo/logs/
 windows-strix-halo/logs/**/*.out.log
+windows-rtx3090/logs/
 macos-m1-pro/results/
 agentic*.out.log
 .benchloop-home/
@@ -48,3 +49,15 @@ windows-strix-halo/tools/llama-*-bin-win-vulkan-x64.zip
 
 # Bundled Python runtime
 windows-strix-halo/tools/python312/
+
+# Local llama.cpp CUDA runtime (install via Install-LlamaCuda.ps1)
+windows-rtx3090/runtime/
+
+# Model weights (download via Download-Model.ps1)
+windows-rtx3090/models/
+
+# Generated benchmark run artifacts
+windows-rtx3090/bench/*.json
+windows-rtx3090/bench/*.csv
+windows-rtx3090/bench/report.html
+windows-rtx3090/runs/

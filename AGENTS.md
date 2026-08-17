@@ -5,6 +5,7 @@
 - `proxy-lan-server/`: shared OpenAI/Anthropic-compatible LAN adapter and Gemma/Qwen response policy.
 - `macos-m1-pro/`: Metal serving and BenchLoop entry points for Gemma 4 QAT/MTP.
 - `windows-strix-halo/`: Vulkan serving, benchmarking, model resolution, and setup scripts.
+- `windows-rtx3090/`: CUDA serving on a single 24GB discrete GPU -- llama.cpp install, model download, and launch scripts.
 - `README.md`: durable benchmark results. Generated logs and copied run artifacts are intentionally untracked.
 
 ## Data Flow

@@ -2,7 +2,7 @@
 
 Benchmarks run locally on Windows with llama.cpp Vulkan and on macOS with llama.cpp Metal. New benchmark results should be added to this README when they are run.
 
-Shared LAN/proxy server tooling lives in [`proxy-lan-server/`](proxy-lan-server/). Windows scripts, llama.cpp builds, and benchmark harnesses live in [`windows-strix-halo/`](windows-strix-halo/). macOS M1 Pro Gemma 4 QAT / MTP BenchLoop runs live in [`macos-m1-pro/`](macos-m1-pro/).
+Shared LAN/proxy server tooling lives in [`proxy-lan-server/`](proxy-lan-server/). Windows scripts, llama.cpp builds, and benchmark harnesses live in [`windows-strix-halo/`](windows-strix-halo/) (unified-memory APU, Vulkan) and [`windows-rtx3090/`](windows-rtx3090/) (single 24GB discrete GPU, CUDA). macOS M1 Pro Gemma 4 QAT / MTP BenchLoop runs live in [`macos-m1-pro/`](macos-m1-pro/).
 
 The merged Gemma/Qwen harness lives in [`proxy-lan-server/`](proxy-lan-server/): [`proxy.mjs`](proxy-lan-server/proxy.mjs), [`test.mjs`](proxy-lan-server/test.mjs), [`lan-adapter.js`](proxy-lan-server/lan-adapter.js), and [`gemma_qwen_merged_policy.json`](proxy-lan-server/gemma_qwen_merged_policy.json). It is the single shared OpenAI-compatible adapter for BenchLoop, OpenClaw/ClawBench, Hermes Agent, opencode, and similar local agent clients.
 
@@ -103,3 +103,67 @@ Config: [`reasoning-off-131k-q4-mtp-toggle.json`](windows-strix-halo/configs/rea
 | `Qwopus3.6-27B-Coder-MTP-Q3_K_M.gguf` | MTP | 131072 | `0.85 / 0.95 / 20` | 76.8 | 85.4 | 53.6 | 18.75 tok/s | 100.0 | 86.7 | 96.9 | 77.5 | 71.1 | 80.0 |
 | `Qwopus3.6-35B-A3B-v1-MTP-Q5_K_M.gguf` | MTP | 131072 | `0.85 / 0.95 / 20` | 78.3 | 83.9 | 69.2 | 47.25 tok/s | 93.8 | 96.7 | 96.9 | 78.4 | 64.5 | 73.3 |
 | `gemma-4-31B-it-qat-UD-Q4_K_XL.gguf` | MTP | 131072 | `1.0 / 0.95 / 64` | 80.8 | 89.2 | 54.6 | 19.87 tok/s | 100.0 | 83.3 | 96.9 | 89.3 | 85.6 | 80.0 |
+
+## Windows RTX 3090 (CUDA)
+
+Single discrete 24GB GPU, llama.cpp CUDA. Full setup, benchmark tables, and debugging notes: [`windows-rtx3090/`](windows-rtx3090/), [`windows-rtx3090/AGENTS.md`](windows-rtx3090/AGENTS.md). Full interactive report with per-depth tables: [bench report](https://claude.ai/code/artifact/bc4d5133-c909-4dc3-9bd9-6fc7d93af8b0).
+
+### Hardware
+
+- CPU: `AMD Ryzen 9 7940HS` (8 cores / 16 threads) -- a mobile chip, GPU is very likely attached via eGPU (Thunderbolt/USB4/Oculink)
+- GPU: `NVIDIA GeForce RTX 3090`, 24576 MiB VRAM, WDDM driver model
+- System RAM: `32 GiB`
+- Runtime: llama.cpp CUDA 12.4 prebuilt binaries, build `b10453`
+
+### Model
+
+`vcruz305/Qwen3.8-27B-AEON-ULTIMATE-UNCENSORED-GGUF`, Q4_K_M (16.8GB) + MTP draft head Q4_0 (1.9GB). Architecture `qwen35`, 65 layers, native `262144` context. Its KV cache is MLA-style (compressed), not plain GQA -- naive bytes/token math badly overestimates VRAM cost; the measured numbers below are what to trust instead.
+
+### Recommended profile: full native context, no MTP
+
+```powershell
+-c 262144 -ngl 999 -fa on --jinja -np 1 -t 12       # full native context window
+--cache-type-k q4_0 --cache-type-v q4_0             # not q8_0 -- see notes
+--reasoning-format deepseek --reasoning-effort medium  # model defaults to xhigh, badly overthinks simple prompts
+--temp 1.0 --top-p 0.95 --top-k 30 --min-p 0.0 --presence-penalty 0.0
+```
+
+MTP (`--model-draft ... --spec-type draft-mtp --spec-draft-n-max 2 --spec-draft-type-k/v q4_0`) is available via `-EnableMtp` but **off by default** -- see the reversal finding below.
+
+### Context-length ceiling (measured, main model + MTP draft loaded, `-ngl 999`)
+
+| Context | Cache | MTP | VRAM | Result |
+|---|---|---|---:|---|
+| 32768 | q8_0 | on | 19.3 GB | matches model author's own recommended default |
+| 163840 | q8_0 | on | 24.2 GB | stable, full speed |
+| 184320 | q8_0 | on | 24.1 GB | loads and answers, but collapses to ~1.5 tok/s (q8_0 hits a slow flash-attention fallback path on Ampere once VRAM is this tight) |
+| 200000+ | q8_0 | on | -- | MTP draft model fails to load: `invalid vector subscript` (reproducible build bug, independent of free memory) |
+| **262144 (full native)** | **q4_0** | off | 22.0 GB | stable, normal speed (~39 tok/s) |
+| **262144 (full native)** | **q4_0** | on | 24.2 GB | stable -- draft cache must *also* be q4_0, a q8_0 draft cache still crashes at load even with a q4_0 main cache |
+
+f16 cache is never correct here: it needs 2x q4_0's footprint on this hardware, so it caps out at a *smaller* usable context than q4_0, not a larger one -- despite that being a common online tip (aimed at unified-memory hardware with far more addressable RAM than a discrete GPU, not a single 24GB card).
+
+### The MTP reversal: content-dependent, and it flips hard at depth
+
+Single-stream decode tok/s, matched depths, generic (non-code) content:
+
+| Depth | 163840/q8_0/MTP | 262144/q4_0/no-MTP |
+|---|---:|---:|
+| 0 | 13.8 | 29.1 |
+| 8192 | 2.0 | 11.2 |
+| 32768 | 0.2 | 3.5 |
+
+Real-world confirmation -- ToolCall-15 category I (context/state) scenarios with 50% of each config's context window pre-filled with unrelated content:
+
+| | 163840/q8_0/MTP | 262144/q4_0/no-MTP |
+|---|---:|---:|
+| Avg time/scenario | 1145s | 244s (**4.7x faster**) |
+| Quality score | 85 | 80 (one-scenario gap at unseeded temp 1.0 -- noise, not signal) |
+
+Mechanism: a rejected MTP draft token still costs a full forward pass, and that pass's attention cost scales with total context length -- so on content MTP predicts poorly (most prose), every rejection gets more expensive as the conversation grows, compounding badly. On code/structured output specifically, draft acceptance is 90%+ and MTP is a clean ~1.7x win (55.6 vs 30.8 tok/s at shallow depth) -- the tradeoff is real, just the opposite of "MTP always helps."
+
+### Notes
+
+- Original launch flags (`--top_p`, `--top_k`, `--min_p`, `--presence_penalty`, `--spec-default` alongside `--spec-type`) don't parse or conflict on this llama.cpp build -- use dashed flag names (`--top-p` etc.) and drop `--spec-default`, an unrelated n-gram speculative-decoding preset.
+- ToolCall-15 scores on an *identical* config varied 97-100 across runs (unseeded `temperature 1.0` on the model side) -- treat small score gaps between configs as noise, not signal.
+- Windows GPU driver TDR (Timeout Detection and Recovery) reset the CUDA context mid-benchmark, triggered by concurrent requests against the single-slot (`-np 1`) server rather than raw context depth. Fixed via `Fix-TDR-Timeout.ps1` (`TdrDelay` 2s -> 10s, admin + reboot required).
